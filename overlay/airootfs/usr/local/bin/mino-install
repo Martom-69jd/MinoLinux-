@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# mino-install: установка MinoLinux (минимальный Arch-based, под слабое железо) на ВЕСЬ выбранный диск.
+#   BIOS -> MBR + GRUB (i386-pc);  UEFI -> GPT + ESP(/boot) + GRUB (x86_64-efi, --removable)
+#   Корень ext4 (noatime,commit=60), swap = zram (lz4), ядро linux-lts, zswap выключен.
+# УНИЧТОЖАЕТ все данные на выбранном диске.
+# ВНИМАНИЕ: скрипт не тестировался на реальном железе. Прочитайте его перед запуском.
+set -euo pipefail
+trap 'echo "Сбой на строке $LINENO. Разделы оставлены смонтированными в /mnt для диагностики." >&2' ERR
+
+MINO_DIR=/usr/share/mino
+die() { echo "Ошибка: $*" >&2; exit 1; }
+ask() { local a; read -rp "$1 [$2]: " a; REPLY=${a:-$2}; }
+ask_secret() {
+  local p1 p2
+  while true; do
+    read -rsp "$1: " p1; echo
+    read -rsp "Повторите: " p2; echo
+    if [[ -n $p1 && $p1 == "$p2" ]]; then REPLY=$p1; return; fi
+    echo "Пусто или не совпало, ещё раз."
+  done
+}
+
+# ---------- проверки ----------
+[[ $EUID -eq 0 ]] || die "запустите от root"
+for c in pacstrap arch-chroot genfstab parted mkfs.ext4 curl; do
+  command -v "$c" >/dev/null || die "не найдено: $c"
+done
+[[ -d $MINO_DIR ]] || die "нет $MINO_DIR: это не образ MinoLinux"
+curl -fsS -m 10 -o /dev/null https://archlinux.org || die "нет сети. Подключитесь: nmtui (или кабель)"
+
+if [[ -d /sys/firmware/efi/efivars ]]; then UEFI=1; else UEFI=0; fi
+if [[ $UEFI == 1 ]]; then echo "Режим загрузки: UEFI"; else echo "Режим загрузки: BIOS"; fi
+
+# ---------- вопросы ----------
+echo; echo "Доступные диски (ROTA: 1 = HDD, 0 = SSD):"
+lsblk -dpno NAME,SIZE,ROTA,MODEL,TRAN | grep -vE '^/dev/(loop|sr|zram|ram)' || true
+read -rp "Диск для установки (например /dev/sda): " DISK
+[[ -b $DISK && $(lsblk -dno TYPE "$DISK") == disk ]] || die "$DISK не является диском"
+
+LIVE_SRC=$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null || true)
+if [[ -n $LIVE_SRC ]]; then
+  LIVE_PK=$(lsblk -no PKNAME "$LIVE_SRC" 2>/dev/null | head -n1 || true)
+  [[ -z $LIVE_PK || /dev/$LIVE_PK != "$DISK" ]] || die "это диск, с которого загружен live-образ"
+fi
+if grep -q "^$DISK" /proc/mounts; then die "на $DISK есть смонтированные разделы"; fi
+
+ask "Имя хоста" "mino"; HOST=$REPLY
+ask "Имя пользователя" "user"; USERNAME=$REPLY
+[[ $USERNAME =~ ^[a-z_][a-z0-9_-]*$ ]] || die "недопустимое имя пользователя"
+ask "Часовой пояс (Region/City, например Europe/Berlin)" "UTC"; TZ_NAME=$REPLY
+[[ -e /usr/share/zoneinfo/$TZ_NAME ]] || die "нет часового пояса $TZ_NAME"
+ask "Системная локаль: en_US.UTF-8 или ru_RU.UTF-8" "en_US.UTF-8"; LOCALE=$REPLY
+[[ $LOCALE == en_US.UTF-8 || $LOCALE == ru_RU.UTF-8 ]] || die "поддерживаются только en_US.UTF-8 и ru_RU.UTF-8"
+echo "Рабочий стол: 1) Openbox   2) Openbox + XFCE (резерв)   3) без графики"
+ask "Выбор" "1"; DESK=$REPLY
+[[ $DESK == 1 || $DESK == 2 || $DESK == 3 ]] || die "выберите 1, 2 или 3"
+ask "Поставить запасное ядро linux рядом с linux-lts? (y/n)" "n"; FALLBACK=$REPLY
+ask "Отсортировать зеркала через reflector? (y/n)" "y"; RANK=$REPLY
+COUNTRIES=""
+if [[ $RANK == y ]]; then ask "Страны зеркал (англ., через запятую)" "Germany,Netherlands"; COUNTRIES=$REPLY; fi
+ask_secret "Пароль root"; ROOT_PW=$REPLY
+ask_secret "Пароль пользователя $USERNAME"; USER_PW=$REPLY
+
+echo
+echo "Будет СТЁРТО ВСЁ на $DISK. Создаётся: $( [[ $UEFI == 1 ]] && echo 'GPT: ESP 512 МиБ + ext4' || echo 'MBR: один раздел ext4' ), swap только zram."
+read -rp "Для подтверждения введите путь диска ($DISK): " CONFIRM
+[[ $CONFIRM == "$DISK" ]] || die "отмена"
+
+# ---------- разметка ----------
+part() { if [[ $DISK =~ [0-9]$ ]]; then echo "${DISK}p$1"; else echo "${DISK}$1"; fi; }
+wipefs -af "$DISK"
+if [[ $UEFI == 1 ]]; then
+  parted -s "$DISK" mklabel gpt mkpart ESP fat32 1MiB 513MiB set 1 esp on mkpart root ext4 513MiB 100%
+  ESP=$(part 1); ROOT=$(part 2)
+else
+  parted -s "$DISK" mklabel msdos mkpart primary ext4 1MiB 100% set 1 boot on
+  ROOT=$(part 1)
+fi
+partprobe "$DISK"; udevadm settle; sleep 1
+if [[ $UEFI == 1 ]]; then mkfs.fat -F32 "$ESP"; fi
+mkfs.ext4 -F -L root "$ROOT"
+mount -o noatime,commit=60 "$ROOT" /mnt
+if [[ $UEFI == 1 ]]; then mkdir -p /mnt/boot; mount "$ESP" /mnt/boot; fi
+
+# ---------- зеркала и пакеты ----------
+if [[ $RANK == y ]]; then
+  reflector --country "$COUNTRIES" --protocol https --latest 20 --sort rate \
+    --save /etc/pacman.d/mirrorlist || echo "reflector не сработал, остаётся текущий mirrorlist"
+fi
+
+PKGS=(base linux-lts linux-firmware grub networkmanager sudo nano zram-generator earlyoom reflector smartmontools)
+VENDOR=$(grep -m1 vendor_id /proc/cpuinfo || true)
+case $VENDOR in
+  *GenuineIntel*) PKGS+=(intel-ucode) ;;
+  *AuthenticAMD*) PKGS+=(amd-ucode) ;;
+esac
+if [[ $UEFI == 1 ]]; then PKGS+=(efibootmgr); fi
+if [[ $FALLBACK == y ]]; then PKGS+=(linux); fi
+if [[ $DESK != 3 ]]; then
+  mapfile -t DP < <(sed -E 's/#.*//; /^[[:space:]]*$/d' "$MINO_DIR/packages-desktop.txt")
+  PKGS+=("${DP[@]}")
+fi
+if [[ $DESK == 2 ]]; then
+  mapfile -t XP < <(sed -E 's/#.*//; /^[[:space:]]*$/d' "$MINO_DIR/packages-xfce.txt")
+  PKGS+=("${XP[@]}")
+fi
+
+pacstrap -K /mnt "${PKGS[@]}"
+genfstab -U /mnt >> /mnt/etc/fstab
+
+# ---------- настройки из руководства ----------
+install -Dm644 /etc/systemd/zram-generator.conf        /mnt/etc/systemd/zram-generator.conf
+install -Dm644 /etc/sysctl.d/99-mino.conf            /mnt/etc/sysctl.d/99-mino.conf
+install -Dm644 /etc/udev/rules.d/60-ioschedulers.rules /mnt/etc/udev/rules.d/60-ioschedulers.rules
+install -Dm644 /etc/systemd/journald.conf.d/size.conf  /mnt/etc/systemd/journald.conf.d/size.conf
+sed -i -E 's/^#?Color/Color/; s/^#?ParallelDownloads.*/ParallelDownloads = 5/' /mnt/etc/pacman.conf
+
+if [[ $DESK != 3 ]]; then
+  install -Dm644 "$MINO_DIR/skel/.xinitrc"                /mnt/etc/skel/.xinitrc
+  install -Dm644 "$MINO_DIR/skel/.bash_profile"           /mnt/etc/skel/.bash_profile
+  install -Dm644 "$MINO_DIR/skel/.config/mpv/mpv.conf"    /mnt/etc/skel/.config/mpv/mpv.conf
+  install -Dm644 "$MINO_DIR/firefox-user.js"              /mnt/usr/share/mino/firefox-user.js
+fi
+
+# ---------- настройка внутри chroot ----------
+cat > /mnt/root/mino-chroot.sh <<'CHROOT'
+#!/usr/bin/env bash
+set -euo pipefail
+ln -sf "/usr/share/zoneinfo/$TZ_NAME" /etc/localtime
+hwclock --systohc
+sed -i -E 's/^#(en_US\.UTF-8 UTF-8|ru_RU\.UTF-8 UTF-8)/\1/' /etc/locale.gen
+locale-gen
+echo "LANG=$LOCALE" > /etc/locale.conf
+printf 'KEYMAP=us\nFONT=cyr-sun16\n' > /etc/vconsole.conf
+echo "$HOST" > /etc/hostname
+useradd -m -G wheel -s /bin/bash "$USERNAME"
+echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/10-wheel
+chmod 440 /etc/sudoers.d/10-wheel
+systemctl enable NetworkManager.service earlyoom.service
+systemctl disable NetworkManager-wait-online.service || true
+systemctl mask ModemManager.service avahi-daemon.service avahi-daemon.socket
+sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet loglevel=3 zswap.enabled=0 nowatchdog"/' /etc/default/grub
+sed -i 's/^GRUB_DISTRIBUTOR=.*/GRUB_DISTRIBUTOR="Mino"/' /etc/default/grub
+if [[ $UEFI == 1 ]]; then
+  grub-install --target=x86_64-efi --efi-directory=/boot --removable
+else
+  grub-install --target=i386-pc "$DISK"
+fi
+grub-mkconfig -o /boot/grub/grub.cfg
+CHROOT
+chmod 700 /mnt/root/mino-chroot.sh
+arch-chroot /mnt env TZ_NAME="$TZ_NAME" LOCALE="$LOCALE" HOST="$HOST" \
+  USERNAME="$USERNAME" DISK="$DISK" UEFI="$UEFI" /root/mino-chroot.sh
+rm -f /mnt/root/mino-chroot.sh
+
+echo "root:$ROOT_PW"         | arch-chroot /mnt chpasswd
+echo "$USERNAME:$USER_PW"    | arch-chroot /mnt chpasswd
+
+sync
+umount -R /mnt
+echo
+echo "Готово. Выньте носитель и перезагрузитесь: reboot"
+if [[ $DESK != 3 ]]; then echo "Вход на tty1 запускает Openbox. SESSION=xfce startx: запуск XFCE. touch ~/.nostartx: отключить автозапуск."; fi

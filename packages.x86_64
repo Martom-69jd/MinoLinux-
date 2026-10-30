@@ -1,0 +1,38 @@
+# Пакеты live-образа. @KERNEL@ подставляет build.sh (по умолчанию linux-lts).
+# Список рабочего стола добавляется из overlay/airootfs/usr/share/mino/packages-desktop.txt
+# --- база и загрузка ---
+base
+@KERNEL@
+linux-firmware
+amd-ucode
+intel-ucode
+mkinitcpio
+mkinitcpio-archiso
+syslinux
+memtest86+
+memtest86+-efi
+edk2-shell
+grub
+efibootmgr
+# --- установка и диагностика ---
+arch-install-scripts
+archinstall
+parted
+gptfdisk
+dosfstools
+e2fsprogs
+reflector
+smartmontools
+hdparm
+pciutils
+usbutils
+dmidecode
+mesa-utils
+nano
+curl
+# --- сеть ---
+networkmanager
+# --- настройка под слабое железо ---
+zram-generator
+earlyoom
+sudo
