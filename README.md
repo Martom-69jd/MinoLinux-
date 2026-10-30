@@ -1,1 +1,1 @@
-# MinoLinux-
+# MinoLinux
