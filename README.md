@@ -84,3 +84,6 @@ In the BIOS, set SATA mode to **AHCI**.
    run `setfont cyr-sun16`. Note that the installer prompts and the live-image banner (`/etc/motd`) are written
    in Russian and have not been translated.
 5. The live session runs as root (like the standard Arch image).
+
+
+New update 10.11
