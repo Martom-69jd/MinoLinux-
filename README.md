@@ -86,4 +86,4 @@ In the BIOS, set SATA mode to **AHCI**.
 5. The live session runs as root (like the standard Arch image).
 
 
-New update 10.11
+New update 17.11
