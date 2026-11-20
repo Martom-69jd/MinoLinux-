@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# mino-lang: change the language of MinoLinux. The system is English by default and this is the only
+# place where the language is changed.
+#
+#   mino-lang list                  list the supported languages
+#   mino-lang show                  show the current settings
+#   mino-lang <code>                set the system-wide language (asks for sudo)
+#   mino-lang --user <code>         set the language for the current user only
+#   mino-lang --enable <code>       only generate the locale (needed before --user as a normal user)
+#   mino-lang --no-packages <code>  do not install application language packs
+#
+# A system-wide change: enables the locale in /etc/locale.gen and runs locale-gen, writes LANG to
+# /etc/locale.conf, sets the console font in /etc/vconsole.conf (Cyrillic needs one), writes the X keyboard
+# layouts to /etc/X11/xorg.conf.d/00-keyboard.conf (Alt+Shift switches layouts) and, if Firefox is installed,
+# installs its language pack. Log out and in (or reboot) to apply everything.
+set -euo pipefail
+
+ARGS=("$@")
+ROOT=${MINO_LANG_ROOT:-}   # test hook: prefix for all /etc paths; disables locale-gen, pacman, systemctl, sudo
+
+# code | English name | locale | X keyboard layouts | console font | Firefox language pack
+LANGS=(
+  "en|English|en_US.UTF-8|us||"
+  "ru|Russian|ru_RU.UTF-8|us,ru|cyr-sun16|firefox-i18n-ru"
+  "de|German|de_DE.UTF-8|de,us||firefox-i18n-de"
+  "fr|French|fr_FR.UTF-8|fr,us||firefox-i18n-fr"
+  "es|Spanish|es_ES.UTF-8|es,us||firefox-i18n-es-es"
+  "it|Italian|it_IT.UTF-8|it,us||firefox-i18n-it"
+)
+
+die()  { echo "mino-lang: $*" >&2; exit 1; }
+warn() { echo "mino-lang: warning: $*" >&2; }
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
+
+L_NAME="" L_LOCALE="" L_XKB="" L_FONT="" L_FF=""
+find_lang() {
+  local e code
+  for e in "${LANGS[@]}"; do
+    IFS='|' read -r code L_NAME L_LOCALE L_XKB L_FONT L_FF <<<"$e"
+    [[ $code == "$1" ]] && return 0
+  done
+  return 1
+}
+
+# set_kv FILE KEY VALUE: replace "KEY=..." or append it
+set_kv() {
+  local f=$1 k=$2 v=$3
+  mkdir -p "$(dirname "$f")"
+  touch "$f"
+  if grep -q "^${k}=" "$f"; then sed -i "s|^${k}=.*|${k}=${v}|" "$f"; else echo "${k}=${v}" >> "$f"; fi
+}
+
+enable_locale() {
+  local l=$1 f="$ROOT/etc/locale.gen"
+  touch "$f"
+  if grep -qE "^${l} UTF-8" "$f"; then
+    :
+  elif grep -qE "^#[[:space:]]*${l} UTF-8" "$f"; then
+    sed -i -E "s/^#[[:space:]]*(${l} UTF-8)/\1/" "$f"
+  else
+    echo "${l} UTF-8" >> "$f"
+  fi
+  if [[ -z $ROOT ]]; then locale-gen >/dev/null; fi
+}
+
+write_keyboard() {
+  local f="$ROOT/etc/X11/xorg.conf.d/00-keyboard.conf"
+  if [[ -f $f ]] && ! grep -q "Managed by mino-lang" "$f"; then
+    warn "$f was not created by mino-lang; leaving the X keyboard layout alone"
+    return
+  fi
+  mkdir -p "$(dirname "$f")"
+  {
+    echo "# Managed by mino-lang"
+    echo 'Section "InputClass"'
+    echo '    Identifier "system-keyboard"'
+    echo '    MatchIsKeyboard "on"'
+    echo "    Option \"XkbLayout\" \"$L_XKB\""
+    if [[ $L_XKB == *,* ]]; then echo '    Option "XkbOptions" "grp:alt_shift_toggle"'; fi
+    echo 'EndSection'
+  } > "$f"
+}
+
+set_system() {
+  if [[ -z $ROOT && $EUID -ne 0 ]]; then
+    command -v sudo >/dev/null || die "root is required (sudo not found)"
+    exec sudo "$0" "${ARGS[@]}"
+  fi
+  enable_locale "$L_LOCALE"
+  if (( ENABLE_ONLY )); then echo "Locale $L_LOCALE generated."; return; fi
+
+  set_kv "$ROOT/etc/locale.conf" LANG "$L_LOCALE"
+
+  local vc="$ROOT/etc/vconsole.conf"
+  touch "$vc"
+  grep -q '^KEYMAP=' "$vc" || set_kv "$vc" KEYMAP us
+  if [[ -n $L_FONT ]]; then set_kv "$vc" FONT "$L_FONT"; else sed -i '/^FONT=/d' "$vc"; fi
+  if [[ -z $ROOT ]]; then systemctl restart systemd-vconsole-setup.service >/dev/null 2>&1 || true; fi
+
+  write_keyboard
+
+  if (( ! NO_PACKAGES )) && [[ -n $L_FF && -z $ROOT ]] && pacman -Q firefox >/dev/null 2>&1; then
+    if pacman -Si "$L_FF" >/dev/null 2>&1; then
+      pacman -S --needed --noconfirm "$L_FF" || warn "could not install $L_FF"
+    else
+      warn "package $L_FF not found (run: sudo pacman -Sy), Firefox stays in English"
+    fi
+  fi
+  echo "System language set to $L_NAME ($L_LOCALE)."
+  echo "Log out and back in (or reboot) to apply it everywhere."
+  if [[ -n $L_FF ]]; then echo "Firefox: choose the language in Settings -> Language after installing the pack."; fi
+}
+
+set_user() {
+  if [[ -z $ROOT ]] && ! locale -a | grep -qiE "^${L_LOCALE%%.*}\.utf-?8$"; then
+    die "locale $L_LOCALE is not generated yet. Run once: mino-lang --enable ${1}"
+  fi
+  local f="${XDG_CONFIG_HOME:-$HOME/.config}/locale.conf"
+  set_kv "$f" LANG "$L_LOCALE"
+  echo "Language of user $(id -un) set to $L_NAME ($L_LOCALE) in $f."
+  echo "Log out and back in to apply it."
+}
+
+show() {
+  local sys usr font kb
+  sys=$(grep -s '^LANG=' "$ROOT/etc/locale.conf" | cut -d= -f2 || true)
+  usr=$(grep -s '^LANG=' "${XDG_CONFIG_HOME:-$HOME/.config}/locale.conf" | cut -d= -f2 || true)
+  font=$(grep -s '^FONT=' "$ROOT/etc/vconsole.conf" | cut -d= -f2 || true)
+  kb=$(grep -s 'XkbLayout' "$ROOT/etc/X11/xorg.conf.d/00-keyboard.conf" | sed -E 's/.*"XkbLayout" "([^"]*)".*/\1/' || true)
+  echo "System language : ${sys:-not set (en_US.UTF-8 default)}"
+  echo "User language   : ${usr:-not set}"
+  echo "Console font    : ${font:-default}"
+  echo "X keyboard      : ${kb:-default (us)}"
+}
+
+list() {
+  local e code name loc
+  printf '%-6s %-10s %s\n' CODE LANGUAGE LOCALE
+  for e in "${LANGS[@]}"; do
+    IFS='|' read -r code name loc _ <<<"$e"
+    printf '%-6s %-10s %s\n' "$code" "$name" "$loc"
+  done
+}
+
+NO_PACKAGES=0 USER_MODE=0 ENABLE_ONLY=0 cmd=""
+while (( $# )); do
+  case $1 in
+    -h|--help|help) usage; exit 0 ;;
+    --user) USER_MODE=1 ;;
+    --no-packages) NO_PACKAGES=1 ;;
+    --enable) ENABLE_ONLY=1 ;;
+    -*) die "unknown option: $1 (see: mino-lang --help)" ;;
+    *) if [[ -z $cmd ]]; then cmd=$1; else die "too many arguments"; fi ;;
+  esac
+  shift
+done
+
+case $cmd in
+  "")   usage; exit 1 ;;
+  list) list ;;
+  show) show ;;
+  *)
+    find_lang "$cmd" || die "unsupported language '$cmd'. Supported: $(for e in "${LANGS[@]}"; do printf '%s ' "${e%%|*}"; done)"
+    if (( USER_MODE )); then set_user "$cmd"; else set_system; fi
+    ;;
+esac

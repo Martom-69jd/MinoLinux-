@@ -1,0 +1,41 @@
+# Packages of the live image. build.sh replaces @KERNEL@ (default: linux-lts).
+# The desktop list is appended from overlay/airootfs/usr/share/mino/packages-desktop.txt
+# --- base and boot ---
+base
+@KERNEL@
+linux-firmware
+amd-ucode
+intel-ucode
+mkinitcpio
+mkinitcpio-archiso
+syslinux
+memtest86+
+memtest86+-efi
+edk2-shell
+grub
+efibootmgr
+# --- installation and diagnostics ---
+arch-install-scripts
+archinstall
+parted
+gptfdisk
+dosfstools
+e2fsprogs
+reflector
+smartmontools
+hdparm
+pciutils
+usbutils
+dmidecode
+mesa-utils
+nano
+curl
+# --- network ---
+networkmanager
+# --- tuning for old hardware ---
+zram-generator
+earlyoom
+fastfetch
+screenfetch
+# neofetch is gone from the official Arch repositories: the script ships in the overlay (/usr/local/bin/neofetch)
+sudo

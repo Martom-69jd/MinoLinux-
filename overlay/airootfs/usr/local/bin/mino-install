@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# mino-install: install MinoLinux (a minimal Arch-based system for old hardware) onto a WHOLE disk.
+#   BIOS -> MBR + GRUB (i386-pc);  UEFI -> GPT + ESP (/boot) + GRUB (x86_64-efi, --removable)
+#   Root is ext4 (noatime,commit=60), swap is zram (lz4), kernel linux-lts, zswap disabled.
+#   The installed system is English; change the language later with: mino-lang
+# This script DESTROYS all data on the selected disk.
+# WARNING: it has not been tested on real hardware. Read it before running.
+set -euo pipefail
+trap 'echo "Failed at line $LINENO. The target is left mounted on /mnt for inspection." >&2' ERR
+
+MINO_DIR=/usr/share/mino
+die() { echo "Error: $*" >&2; exit 1; }
+ask() { local a; read -rp "$1 [$2]: " a; REPLY=${a:-$2}; }
+ask_secret() {
+  local p1 p2
+  while true; do
+    read -rsp "$1: " p1; echo
+    read -rsp "Repeat: " p2; echo
+    if [[ -n $p1 && $p1 == "$p2" ]]; then REPLY=$p1; return; fi
+    echo "Empty or different, try again."
+  done
+}
+
+# ---------- checks ----------
+[[ $EUID -eq 0 ]] || die "run as root"
+for c in pacstrap arch-chroot genfstab parted mkfs.ext4 curl; do
+  command -v "$c" >/dev/null || die "not found: $c"
+done
+[[ -d $MINO_DIR ]] || die "$MINO_DIR is missing: this is not a MinoLinux image"
+curl -fsS -m 10 -o /dev/null https://archlinux.org || die "no network. Connect first: nmtui (or plug in a cable)"
+
+if [[ -d /sys/firmware/efi/efivars ]]; then UEFI=1; else UEFI=0; fi
+if [[ $UEFI == 1 ]]; then echo "Boot mode: UEFI"; else echo "Boot mode: BIOS"; fi
+
+# ---------- questions ----------
+echo; echo "Available disks (ROTA: 1 = HDD, 0 = SSD):"
+lsblk -dpno NAME,SIZE,ROTA,MODEL,TRAN | grep -vE '^/dev/(loop|sr|zram|ram)' || true
+read -rp "Disk to install to (for example /dev/sda): " DISK
+[[ -b $DISK && $(lsblk -dno TYPE "$DISK") == disk ]] || die "$DISK is not a disk"
+
+LIVE_SRC=$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null || true)
+if [[ -n $LIVE_SRC ]]; then
+  LIVE_PK=$(lsblk -no PKNAME "$LIVE_SRC" 2>/dev/null | head -n1 || true)
+  [[ -z $LIVE_PK || /dev/$LIVE_PK != "$DISK" ]] || die "this is the disk the live image booted from"
+fi
+if grep -q "^$DISK" /proc/mounts; then die "$DISK has mounted partitions"; fi
+
+ask "Host name" "mino"; HOST=$REPLY
+ask "User name" "user"; USERNAME=$REPLY
+[[ $USERNAME =~ ^[a-z_][a-z0-9_-]*$ ]] || die "invalid user name"
+ask "Time zone (Region/City, for example Europe/Berlin)" "UTC"; TZ_NAME=$REPLY
+[[ -e /usr/share/zoneinfo/$TZ_NAME ]] || die "unknown time zone $TZ_NAME"
+echo "Desktop: 1) Openbox   2) Openbox + XFCE (spare)   3) no graphics"
+ask "Choice" "1"; DESK=$REPLY
+[[ $DESK == 1 || $DESK == 2 || $DESK == 3 ]] || die "choose 1, 2 or 3"
+ask "Also install the spare kernel 'linux' next to linux-lts? (y/n)" "n"; FALLBACK=$REPLY
+ask "Rank the mirrors with reflector? (y/n)" "y"; RANK=$REPLY
+COUNTRIES=""
+if [[ $RANK == y ]]; then ask "Mirror countries (English names, comma separated)" "Germany,Netherlands"; COUNTRIES=$REPLY; fi
+ask_secret "Root password"; ROOT_PW=$REPLY
+ask_secret "Password for $USERNAME"; USER_PW=$REPLY
+
+echo
+echo "EVERYTHING on $DISK will be ERASED. Layout: $( [[ $UEFI == 1 ]] && echo 'GPT: 512 MiB ESP + ext4' || echo 'MBR: one ext4 partition' ), swap is zram only."
+read -rp "To confirm, type the disk path ($DISK): " CONFIRM
+[[ $CONFIRM == "$DISK" ]] || die "cancelled"
+
+# ---------- partitioning ----------
+part() { if [[ $DISK =~ [0-9]$ ]]; then echo "${DISK}p$1"; else echo "${DISK}$1"; fi; }
+wipefs -af "$DISK"
+if [[ $UEFI == 1 ]]; then
+  parted -s "$DISK" mklabel gpt mkpart ESP fat32 1MiB 513MiB set 1 esp on mkpart root ext4 513MiB 100%
+  ESP=$(part 1); ROOT=$(part 2)
+else
+  parted -s "$DISK" mklabel msdos mkpart primary ext4 1MiB 100% set 1 boot on
+  ROOT=$(part 1)
+fi
+partprobe "$DISK"; udevadm settle; sleep 1
+if [[ $UEFI == 1 ]]; then mkfs.fat -F32 "$ESP"; fi
+mkfs.ext4 -F -L root "$ROOT"
+mount -o noatime,commit=60 "$ROOT" /mnt
+if [[ $UEFI == 1 ]]; then mkdir -p /mnt/boot; mount "$ESP" /mnt/boot; fi
+
+# ---------- mirrors and packages ----------
+if [[ $RANK == y ]]; then
+  reflector --country "$COUNTRIES" --protocol https --latest 20 --sort rate \
+    --save /etc/pacman.d/mirrorlist || echo "reflector failed, keeping the current mirrorlist"
+fi
+
+PKGS=(base linux-lts linux-firmware grub networkmanager sudo nano zram-generator earlyoom
+      fastfetch screenfetch reflector smartmontools)
+VENDOR=$(grep -m1 vendor_id /proc/cpuinfo || true)
+case $VENDOR in
+  *GenuineIntel*) PKGS+=(intel-ucode) ;;
+  *AuthenticAMD*) PKGS+=(amd-ucode) ;;
+esac
+if [[ $UEFI == 1 ]]; then PKGS+=(efibootmgr); fi
+if [[ $FALLBACK == y ]]; then PKGS+=(linux); fi
+if [[ $DESK != 3 ]]; then
+  mapfile -t DP < <(sed -E 's/#.*//; /^[[:space:]]*$/d' "$MINO_DIR/packages-desktop.txt")
+  PKGS+=("${DP[@]}")
+fi
+if [[ $DESK == 2 ]]; then
+  mapfile -t XP < <(sed -E 's/#.*//; /^[[:space:]]*$/d' "$MINO_DIR/packages-xfce.txt")
+  PKGS+=("${XP[@]}")
+fi
+
+pacstrap -K /mnt "${PKGS[@]}"
+genfstab -U /mnt >> /mnt/etc/fstab
+
+# ---------- settings from the guide ----------
+install -Dm644 /etc/systemd/zram-generator.conf        /mnt/etc/systemd/zram-generator.conf
+install -Dm644 /etc/sysctl.d/99-mino.conf              /mnt/etc/sysctl.d/99-mino.conf
+install -Dm644 /etc/udev/rules.d/60-ioschedulers.rules /mnt/etc/udev/rules.d/60-ioschedulers.rules
+install -Dm644 /etc/systemd/journald.conf.d/size.conf  /mnt/etc/systemd/journald.conf.d/size.conf
+sed -i -E 's/^#?Color/Color/; s/^#?ParallelDownloads.*/ParallelDownloads = 5/' /mnt/etc/pacman.conf
+
+# logo, fetch tools and the language command (neofetch is bundled: it is not in the Arch repositories)
+install -Dm644 "$MINO_DIR/logo.ansi"                    /mnt/usr/share/mino/logo.ansi
+install -Dm644 "$MINO_DIR/logo.screenfetch"             /mnt/usr/share/mino/logo.screenfetch
+install -Dm644 "$MINO_DIR/logo.png"                     /mnt/usr/share/mino/logo.png
+install -Dm644 "$MINO_DIR/licenses/neofetch-LICENSE.md" /mnt/usr/share/mino/licenses/neofetch-LICENSE.md
+install -Dm755 /usr/local/bin/neofetch                  /mnt/usr/local/bin/neofetch
+install -Dm755 /usr/local/bin/screenfetch               /mnt/usr/local/bin/screenfetch
+install -Dm755 /usr/local/bin/mino-lang                 /mnt/usr/local/bin/mino-lang
+install -Dm644 "$MINO_DIR/skel/.config/fastfetch/config.jsonc" /mnt/etc/skel/.config/fastfetch/config.jsonc
+install -Dm644 "$MINO_DIR/skel/.config/neofetch/config.conf"   /mnt/etc/skel/.config/neofetch/config.conf
+
+if [[ $DESK != 3 ]]; then
+  install -Dm644 "$MINO_DIR/skel/.xinitrc"                /mnt/etc/skel/.xinitrc
+  install -Dm644 "$MINO_DIR/skel/.bash_profile"           /mnt/etc/skel/.bash_profile
+  install -Dm644 "$MINO_DIR/skel/.config/mpv/mpv.conf"    /mnt/etc/skel/.config/mpv/mpv.conf
+  install -Dm644 "$MINO_DIR/firefox-user.js"              /mnt/usr/share/mino/firefox-user.js
+fi
+
+# ---------- configuration inside the chroot ----------
+cat > /mnt/root/mino-chroot.sh <<'CHROOT'
+#!/usr/bin/env bash
+set -euo pipefail
+ln -sf "/usr/share/zoneinfo/$TZ_NAME" /etc/localtime
+hwclock --systohc
+sed -i -E 's/^#(en_US\.UTF-8 UTF-8)/\1/' /etc/locale.gen
+locale-gen
+echo "LANG=en_US.UTF-8" > /etc/locale.conf
+echo "KEYMAP=us" > /etc/vconsole.conf
+echo "$HOST" > /etc/hostname
+useradd -m -G wheel -s /bin/bash "$USERNAME"
+echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/10-wheel
+chmod 440 /etc/sudoers.d/10-wheel
+systemctl enable NetworkManager.service earlyoom.service
+systemctl disable NetworkManager-wait-online.service || true
+systemctl mask ModemManager.service avahi-daemon.service avahi-daemon.socket
+sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet loglevel=3 zswap.enabled=0 nowatchdog"/' /etc/default/grub
+sed -i 's/^GRUB_DISTRIBUTOR=.*/GRUB_DISTRIBUTOR="Mino"/' /etc/default/grub
+if [[ $UEFI == 1 ]]; then
+  grub-install --target=x86_64-efi --efi-directory=/boot --removable
+else
+  grub-install --target=i386-pc "$DISK"
+fi
+grub-mkconfig -o /boot/grub/grub.cfg
+CHROOT
+chmod 700 /mnt/root/mino-chroot.sh
+arch-chroot /mnt env TZ_NAME="$TZ_NAME" HOST="$HOST" \
+  USERNAME="$USERNAME" DISK="$DISK" UEFI="$UEFI" /root/mino-chroot.sh
+rm -f /mnt/root/mino-chroot.sh
+
+echo "root:$ROOT_PW"         | arch-chroot /mnt chpasswd
+echo "$USERNAME:$USER_PW"    | arch-chroot /mnt chpasswd
+
+sync
+umount -R /mnt
+echo
+echo "Done. Remove the install medium and reboot: reboot"
+echo "The system is in English. To change the language later run: mino-lang list / mino-lang ru"
+if [[ $DESK != 3 ]]; then echo "Logging in on tty1 starts Openbox. SESSION=xfce startx starts XFCE. touch ~/.nostartx disables the autostart."; fi

@@ -1,0 +1,7 @@
+#!/bin/sh
+# MinoLinux wrapper: runs the real screenfetch with the MinoLinux logo.
+# Pass your own -a PATH to use a different logo.
+case " $* " in
+  *" -a "*) exec /usr/bin/screenfetch "$@" ;;
+esac
+exec /usr/bin/screenfetch -a /usr/share/mino/logo.screenfetch "$@"

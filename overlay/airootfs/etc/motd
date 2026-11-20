@@ -1,0 +1,8 @@
+
+ MinoLinux - live image
+   startx           start Openbox (try how responsive it is on your hardware)
+   nmtui            set up the network (Wi-Fi / Ethernet)
+   mino-install     install the system to disk (ERASES the selected disk)
+   archinstall      alternative installer (then tune by hand, see the README)
+   mino-lang        change the language (the system is English by default)
+
